@@ -34,7 +34,7 @@ Generate the demo dataset from the dashboard. It creates five profiles and 60 de
 
 ## AWS SES notifications
 
-High and critical flags trigger a server-side SES email. AWS secrets are never stored in the browser or database. Copy `backend/.env.example` to `backend/.env` and enter the values on your machine; that file is ignored by git. Or configure boto3's standard AWS credential provider chain with a local AWS profile or an IAM role in deployment.
+High and critical flags trigger server-side SES email and SNS topic notifications independently. AWS secrets are never stored in the browser or database. Copy `backend/.env.example` to `backend/.env` and enter the values on your machine; that file is ignored by git. Or configure boto3's standard AWS credential provider chain with a local AWS profile or an IAM role in deployment.
 
 ```sh
 cp backend/.env.example backend/.env
@@ -42,6 +42,6 @@ cp backend/.env.example backend/.env
 npm run api
 ```
 
-Alternatively, configure an AWS CLI profile and set `AWS_PROFILE` instead of adding access keys to the env file. Verify the sender identity in SES, and ensure the IAM principal has only `ses:SendEmail` permission for that identity. In the SES sandbox, verify the recipient address too. When sender/recipient are unset, SENTINEL records a development `mocked` notification; AWS failures are stored as `failed` without returning credential or provider details to the UI.
+Alternatively, configure an AWS CLI profile and set `AWS_PROFILE` instead of adding access keys to the env file. Verify the sender identity in SES, and ensure the IAM principal has only `ses:SendEmail` permission for that identity. In the SES sandbox, verify the recipient address too. Set `AWS_SNS_TOPIC_ARN` to an existing topic in the same region and grant the IAM principal `sns:Publish` on that topic. Configure topic subscriptions separately. Unconfigured channels are recorded as `mocked`; AWS failures are stored as `failed` without returning credential or provider details to the UI.
 
 The default JWT secret and seeded credentials are for local use only. Set `JWT_SECRET_KEY` to a strong local secret and provision real staff accounts before exposing the service beyond a trusted development environment. PostgreSQL deployment is not configured in this demo.

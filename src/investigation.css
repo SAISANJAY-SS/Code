@@ -225,3 +225,43 @@
     grid-template-columns: 1fr;
   }
 }
+
+/* Separate SES and SNS delivery results in investigation details. */
+.notification-channel-list{
+  grid-column: 2/4;
+  display: grid;
+  grid-template-columns: repeat(2,minmax(0,1fr));
+  gap: 8px;
+  margin-top: 6px
+}
+.notification-channel-list>span{
+  display: grid;
+  grid-template-columns: auto auto;
+  gap: 3px 8px;
+  padding: 7px 9px;
+  border: 1px solid #26372e;
+  background:#0e1511;
+  border-radius: 3px
+}
+.notification-channel-list b{
+  color:#aab8ae;
+  font:9px var(--mono)
+}
+.notification-channel-list strong{
+  justify-self:end;
+  color:#c0d2c5;
+  font:9px var(--mono)
+}
+.notification-channel-list small{
+  grid-column: 1/3;
+  color:#7f9085;
+  font-size:9px
+}
+@media(max-width:600px){
+  .notification-channel-list{
+    grid-template-columns:1fr
+  }
+  .notification-channel-list small{
+    font-size:8px
+  }
+}

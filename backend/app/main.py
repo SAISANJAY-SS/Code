@@ -130,24 +130,18 @@ def audit(db: sqlite3.Connection, event: str, details: dict[str, Any], transacti
     )
 
 
-def send_high_risk_email(
+def send_high_risk_notifications(
     db: sqlite3.Connection,
     flag_id: int,
     transaction: sqlite3.Row,
     user_name: str,
     risk: str,
     triggered: list[dict[str, Any]],
-) -> dict[str, str]:
+) -> dict[str, dict[str, str]]:
     sender = os.getenv("AWS_SES_SENDER", "")
     recipient = os.getenv("ALERT_EMAIL", "")
+    sns_topic_arn = os.getenv("AWS_SNS_TOPIC_ARN", "")
     region = os.getenv("AWS_REGION", "ap-south-1")
-    prior = db.execute(
-        "SELECT status FROM notifications WHERE fraud_flag_id=? ORDER BY id DESC LIMIT 1",
-        (flag_id,),
-    ).fetchone()
-    if prior and prior["status"] in {"sent", "mocked"}:
-        return {"status": prior["status"]}
-
     rule_lines = "\n".join(
         f"- {result['rule_name']} ({result['severity']}): {json.dumps(result['evidence'], ensure_ascii=True)}"
         for result in triggered
@@ -160,30 +154,57 @@ def send_high_risk_email(
         f"Location: {transaction['location']}\nTime: {transaction['transaction_date']}\n\n"
         f"Triggered evidence:\n{rule_lines}\n"
     )
-    status = "mocked"
-    message_id = None
-    error_message = None
-    if sender and recipient:
+
+    results: dict[str, dict[str, str]] = {}
+    channels = {
+        "SES": {"configured": bool(sender and recipient), "destination": recipient, "subject": subject},
+        "SNS": {"configured": bool(sns_topic_arn), "destination": sns_topic_arn, "subject": subject},
+    }
+    for channel, config in channels.items():
+        prior = db.execute(
+            "SELECT status,message_id,error_message FROM notifications WHERE fraud_flag_id=? AND channel=? ORDER BY id DESC LIMIT 1",
+            (flag_id, channel),
+        ).fetchone()
+        if prior and prior["status"] == "sent":
+            results[channel] = {"status": prior["status"], "message_id": prior["message_id"] or "", "error": ""}
+            continue
+        if prior and prior["status"] == "mocked" and not config["configured"]:
+            results[channel] = {"status": "mocked", "message_id": "", "error": ""}
+            continue
+
+        status = "mocked"
+        message_id = None
+        error_message = None
         try:
-            ses = boto3.client("ses", region_name=region)
-            response = ses.send_email(
-                Source=sender,
-                Destination={"ToAddresses": [recipient]},
-                Message={
-                    "Subject": {"Data": subject, "Charset": "UTF-8"},
-                    "Body": {"Text": {"Data": body, "Charset": "UTF-8"}},
-                },
-            )
-            status = "sent"
-            message_id = response.get("MessageId")
-        except Exception as error:  # AWS errors are recorded without exposing credentials.
+            if channel == "SES" and config["configured"]:
+                response = boto3.client("ses", region_name=region).send_email(
+                    Source=sender,
+                    Destination={"ToAddresses": [recipient]},
+                    Message={
+                        "Subject": {"Data": subject, "Charset": "UTF-8"},
+                        "Body": {"Text": {"Data": body, "Charset": "UTF-8"}},
+                    },
+                )
+                status = "sent"
+                message_id = response.get("MessageId")
+            elif channel == "SNS" and config["configured"]:
+                response = boto3.client("sns", region_name=region).publish(
+                    TopicArn=sns_topic_arn,
+                    Subject=subject[:100],
+                    Message=body,
+                )
+                status = "sent"
+                message_id = response.get("MessageId")
+        except Exception as error:  # Store only the exception class, never provider responses or credentials.
             status = "failed"
             error_message = type(error).__name__
-    db.execute(
-        "INSERT INTO notifications(fraud_flag_id,channel,recipient,status,message_id,error_message,created_at) VALUES(?,?,?,?,?,?,?)",
-        (flag_id, "SES", recipient or "development-mock", status, message_id, error_message, now_iso()),
-    )
-    return {"status": status, "error": error_message or ""}
+
+        db.execute(
+            "INSERT INTO notifications(fraud_flag_id,channel,recipient,status,message_id,error_message,created_at) VALUES(?,?,?,?,?,?,?)",
+            (flag_id, channel, config["destination"] or "development-mock", status, message_id, error_message, now_iso()),
+        )
+        results[channel] = {"status": status, "message_id": message_id or "", "error": error_message or ""}
+    return results
 
 
 def current_staff(token: str = Depends(oauth_scheme)) -> dict[str, Any]:
@@ -432,18 +453,22 @@ def analyze_user(user_id: str, staff: dict[str, Any] = Depends(current_staff)) -
                 db.execute("""INSERT INTO fraud_flags(transaction_id,risk_level,status,reason,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(transaction_id) DO UPDATE SET risk_level=excluded.risk_level,reason=excluded.reason,updated_at=excluded.updated_at""", (transaction["id"], level, status, f"{len(triggered)} rule(s) triggered", created, now_iso()))
                 flag = db.execute("SELECT id FROM fraud_flags WHERE transaction_id=?", (transaction["id"],)).fetchone()
                 if level in {"HIGH", "CRITICAL"}:
-                    notification = send_high_risk_email(db, flag["id"], transaction, user["name"], level, triggered)
-                    if notification["status"] == "sent":
-                        audit(db, "notification_sent", {"channel": "SES", "status": "sent", "risk_level": level}, transaction["id"], staff["id"])
-                    elif notification["status"] == "failed":
-                        audit(db, "notification_failed", {"channel": "SES", "error": notification["error"]}, transaction["id"], staff["id"])
+                    notifications = send_high_risk_notifications(db, flag["id"], transaction, user["name"], level, triggered)
+                    for channel, notification in notifications.items():
+                        if notification["status"] == "sent":
+                            audit(db, "notification_sent", {"channel": channel, "status": "sent", "risk_level": level}, transaction["id"], staff["id"])
+                        elif notification["status"] == "failed":
+                            audit(db, "notification_failed", {"channel": channel, "error": notification["error"]}, transaction["id"], staff["id"])
             else:
                 db.execute("DELETE FROM fraud_flags WHERE transaction_id=? AND status='UNREVIEWED'", (transaction["id"],))
         triggered_count = sum(sum(1 for result in results if result["triggered"]) for results in results_by_tx.values())
         flag_count = db.execute("SELECT COUNT(*) FROM fraud_flags f JOIN transactions t ON t.id=f.transaction_id WHERE t.user_id=?", (user["id"],)).fetchone()[0]
-        notification_counts = db.execute("SELECT n.status,COUNT(*) count FROM notifications n JOIN fraud_flags f ON f.id=n.fraud_flag_id JOIN transactions t ON t.id=f.transaction_id WHERE t.user_id=? GROUP BY n.status", (user["id"],)).fetchall()
+        notification_counts = db.execute("SELECT n.channel,n.status,COUNT(*) count FROM notifications n JOIN fraud_flags f ON f.id=n.fraud_flag_id JOIN transactions t ON t.id=f.transaction_id WHERE t.user_id=? GROUP BY n.channel,n.status", (user["id"],)).fetchall()
         audit(db, "fraud_analysis_executed", {"user_id": user_id, "transactions_analyzed": len(transactions), "triggered_rule_results": triggered_count, "flags": flag_count}, user_id=staff["id"])
-        return {"user_id": user_id, "transactions_analyzed": len(transactions), "triggered_rule_results": triggered_count, "flagged_transactions": flag_count, "notifications": {row["status"]: row["count"] for row in notification_counts}}
+        notification_summary = {channel: {} for channel in ("SES", "SNS")}
+        for row in notification_counts:
+            notification_summary[row["channel"]][row["status"]] = row["count"]
+        return {"user_id": user_id, "transactions_analyzed": len(transactions), "triggered_rule_results": triggered_count, "flagged_transactions": flag_count, "notifications": notification_summary}
 
 
 @app.get("/fraud-alerts")
@@ -475,7 +500,7 @@ def transaction_analysis(transaction_id: str, staff: dict[str, Any] = Depends(cu
             raise HTTPException(status_code=404, detail="Transaction not found")
         results = db.execute("SELECT rule_name,triggered,severity,evidence,evaluated_at FROM rule_results WHERE transaction_id=? ORDER BY id", (transaction["id"],)).fetchall()
         history = db.execute("SELECT transaction_id,transaction_date,location,latitude,longitude,amount FROM transactions WHERE user_id=? AND transaction_date<? ORDER BY transaction_date DESC LIMIT 8", (transaction["user_id"], transaction["transaction_date"])).fetchall()
-        notifications = db.execute("SELECT n.channel,n.status,n.recipient,n.created_at,n.error_message FROM notifications n JOIN fraud_flags f ON f.id=n.fraud_flag_id WHERE f.transaction_id=? ORDER BY n.created_at DESC", (transaction["id"],)).fetchall()
+        notifications = db.execute("SELECT n.channel,n.status,n.recipient,n.created_at,n.error_message FROM notifications n JOIN fraud_flags f ON f.id=n.fraud_flag_id WHERE f.transaction_id=? ORDER BY n.created_at DESC,n.channel", (transaction["id"],)).fetchall()
         transaction_data = dict(transaction)
         transaction_data["user_id"] = transaction_data.pop("business_user_id")
         return {"transaction": transaction_data, "rule_results": [{**dict(row), "triggered": bool(row["triggered"]), "evidence": json.loads(row["evidence"])} for row in results], "history": [dict(row) for row in reversed(history)], "notifications": [dict(row) for row in notifications]}
