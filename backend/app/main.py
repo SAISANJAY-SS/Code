@@ -6,6 +6,7 @@ import math
 import os
 import sqlite3
 import boto3
+from botocore.exceptions import BotoCoreError, ClientError
 from dotenv import load_dotenv
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -231,7 +232,13 @@ def send_high_risk_notifications(
                 )
                 status = "sent"
                 message_id = response.get("MessageId")
-        except Exception as error:  # Store only the exception class, never provider responses or credentials.
+        except ClientError as error:
+            status = "failed"
+            error_message = error.response.get("Error", {}).get("Code", "AWSClientError")
+        except BotoCoreError as error:
+            status = "failed"
+            error_message = type(error).__name__
+        except Exception as error:  # Keep unexpected details private; never expose secrets to the UI.
             status = "failed"
             error_message = type(error).__name__
 

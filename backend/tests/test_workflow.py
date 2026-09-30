@@ -1,5 +1,6 @@
 from pathlib import Path
 
+from botocore.exceptions import ClientError
 from fastapi.testclient import TestClient
 
 from backend.app import main
@@ -123,6 +124,33 @@ def test_sns_is_attempted_when_ses_fails(tmp_path: Path, monkeypatch) -> None:
     assert results["SES"]["status"] == "failed"
     assert results["SNS"]["status"] == "sent"
     assert statuses == {"SES": "failed", "SNS": "sent"}
+
+
+def test_aws_client_error_code_is_saved_without_raw_response(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "sentinel-client-error-test.db")
+    monkeypatch.setenv("AWS_SES_SENDER", "verified@example.test")
+    monkeypatch.setenv("ALERT_EMAIL", "alerts@example.test")
+    monkeypatch.delenv("AWS_SNS_TOPIC_ARN", raising=False)
+
+    class FakeSes:
+        def send_email(self, **kwargs):
+            raise ClientError(
+                {"Error": {"Code": "MessageRejected", "Message": "address not verified"}},
+                "SendEmail",
+            )
+
+    monkeypatch.setattr(main.boto3, "client", lambda service, **kwargs: FakeSes())
+    main.init_db()
+    with main.connect() as db:
+        user_id = db.execute("INSERT INTO users(user_id,name,email,scenario,home_location,latitude,longitude,device_id) VALUES(?,?,?,?,?,?,?,?)", ("USER-CLIENTERR", "Client Error", "clienterr@example.test", "test", "Pune", 18.5204, 73.8567, "DEV-CLIENTERR")).lastrowid
+        transaction_id = db.execute("INSERT INTO transactions(transaction_id,user_id,amount,transaction_date,location,latitude,longitude,device_id) VALUES(?,?,?,?,?,?,?,?)", ("TXN-CLIENTERR", user_id, 5000, main.now_iso(), "Pune", 18.5204, 73.8567, "DEV-CLIENTERR")).lastrowid
+        flag_id = db.execute("INSERT INTO fraud_flags(transaction_id,risk_level,status,reason,created_at,updated_at) VALUES(?,?,?,?,?,?)", (transaction_id, "MEDIUM", "UNREVIEWED", "test", main.now_iso(), main.now_iso())).lastrowid
+        transaction = db.execute("SELECT * FROM transactions WHERE id=?", (transaction_id,)).fetchone()
+        result = main.send_high_risk_notifications(db, flag_id, transaction, "USER-CLIENTERR", "Client Error", "MEDIUM", [{"rule_name": "Amount", "severity": "MEDIUM", "evidence": {}}])
+        saved_error = db.execute("SELECT error_message FROM notifications WHERE fraud_flag_id=? AND channel='SES'", (flag_id,)).fetchone()["error_message"]
+
+    assert result["SES"]["status"] == "failed"
+    assert saved_error == "MessageRejected"
 
 
 def test_reference_environment_variable_names_are_supported(tmp_path: Path, monkeypatch) -> None:
