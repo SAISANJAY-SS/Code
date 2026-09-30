@@ -1,0 +1,29 @@
+@import url('https://fonts.googleapis.com/css2?family=DM+Mono:wght@400;500&family=Manrope:wght@400;500;600;700;800&display=swap');
+
+:root {
+  font-family: 'Manrope', 'Avenir Next', sans-serif;
+  color: #eaf0ed;
+  background: #080d0c;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  --bg: #080d0c;
+  --surface: #101715;
+  --surface-raised: #141c19;
+  --line: #23302b;
+  --muted: #86958e;
+  --faint: #62716a;
+  --text: #eaf0ed;
+  --mint: #43d9a3;
+  --amber: #e8b75c;
+  --coral: #f17d62;
+  --blue: #78a9e8;
+  --mono: 'DM Mono', ui-monospace, monospace;
+  font-weight: 400;
+}
+* { box-sizing: border-box; }
+body { margin: 0; min-width: 320px; min-height: 100vh; }
+button, input, textarea, select { font: inherit; }
+button { color: inherit; }
+::selection { color: #07100d; background: #43d9a3; }
+#root { min-height: 100vh; }
