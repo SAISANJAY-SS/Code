@@ -135,6 +135,7 @@ def send_high_risk_notifications(
     db: sqlite3.Connection,
     flag_id: int,
     transaction: sqlite3.Row,
+    user_id: str,
     user_name: str,
     risk: str,
     triggered: list[dict[str, Any]],
@@ -143,6 +144,8 @@ def send_high_risk_notifications(
     recipient = os.getenv("ALERT_EMAIL") or os.getenv("SES_RECIPIENT_EMAIL", "")
     sns_topic_arn = os.getenv("AWS_SNS_TOPIC_ARN") or os.getenv("SNS_TOPIC_ARN", "")
     region = os.getenv("AWS_REGION", "ap-south-1")
+    topic_arn_parts = sns_topic_arn.split(":")
+    sns_region = topic_arn_parts[3] if len(topic_arn_parts) == 6 and topic_arn_parts[2] == "sns" else region
     rule_lines = "\n".join(
         f"- {result['rule_name']} ({result['severity']}): {json.dumps(result['evidence'], ensure_ascii=True)}"
         for result in triggered
@@ -151,7 +154,7 @@ def send_high_risk_notifications(
     body = (
         "SENTINEL detected a high-risk transaction.\n\n"
         f"Risk: {risk}\nTransaction: {transaction['transaction_id']}\n"
-        f"Profile: {user_name}\nAmount: {transaction['currency']} {transaction['amount']:,.2f}\n"
+        f"User ID: {user_id}\nProfile: {user_name}\nAmount: {transaction['currency']} {transaction['amount']:,.2f}\n"
         f"Location: {transaction['location']}\nTime: {transaction['transaction_date']}\n\n"
         f"Triggered evidence:\n{rule_lines}\n"
     )
@@ -175,6 +178,7 @@ def send_high_risk_notifications(
         f"<h2 style='color:#b5472f'>SENTINEL {html.escape(risk)} Fraud Alert</h2>"
         "<table cellpadding='6' style='border-collapse:collapse'>"
         f"<tr><td><b>Transaction</b></td><td>{safe_transaction_id}</td></tr>"
+        f"<tr><td><b>User ID</b></td><td>{html.escape(user_id)}</td></tr>"
         f"<tr><td><b>Profile</b></td><td>{safe_user_name}</td></tr>"
         f"<tr><td><b>Amount</b></td><td>{safe_amount}</td></tr>"
         f"<tr><td><b>Location</b></td><td>{safe_location}</td></tr>"
@@ -220,7 +224,7 @@ def send_high_risk_notifications(
                 status = "sent"
                 message_id = response.get("MessageId")
             elif channel == "SNS" and config["configured"]:
-                response = boto3.client("sns", region_name=region).publish(
+                response = boto3.client("sns", region_name=sns_region).publish(
                     TopicArn=sns_topic_arn,
                     Subject=subject[:100],
                     Message=body,
@@ -484,13 +488,12 @@ def analyze_user(user_id: str, staff: dict[str, Any] = Depends(current_staff)) -
                 created = existing["created_at"] if existing else now_iso()
                 db.execute("""INSERT INTO fraud_flags(transaction_id,risk_level,status,reason,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(transaction_id) DO UPDATE SET risk_level=excluded.risk_level,reason=excluded.reason,updated_at=excluded.updated_at""", (transaction["id"], level, status, f"{len(triggered)} rule(s) triggered", created, now_iso()))
                 flag = db.execute("SELECT id FROM fraud_flags WHERE transaction_id=?", (transaction["id"],)).fetchone()
-                if level in {"HIGH", "CRITICAL"}:
-                    notifications = send_high_risk_notifications(db, flag["id"], transaction, user["name"], level, triggered)
-                    for channel, notification in notifications.items():
-                        if notification["status"] == "sent":
-                            audit(db, "notification_sent", {"channel": channel, "status": "sent", "risk_level": level}, transaction["id"], staff["id"])
-                        elif notification["status"] == "failed":
-                            audit(db, "notification_failed", {"channel": channel, "error": notification["error"]}, transaction["id"], staff["id"])
+                notifications = send_high_risk_notifications(db, flag["id"], transaction, user["user_id"], user["name"], level, triggered)
+                for channel, notification in notifications.items():
+                    if notification["status"] == "sent":
+                        audit(db, "notification_sent", {"channel": channel, "status": "sent", "risk_level": level}, transaction["id"], staff["id"])
+                    elif notification["status"] == "failed":
+                        audit(db, "notification_failed", {"channel": channel, "error": notification["error"]}, transaction["id"], staff["id"])
             else:
                 db.execute("DELETE FROM fraud_flags WHERE transaction_id=? AND status='UNREVIEWED'", (transaction["id"],))
         triggered_count = sum(sum(1 for result in results if result["triggered"]) for results in results_by_tx.values())

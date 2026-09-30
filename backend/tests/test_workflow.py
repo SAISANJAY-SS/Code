@@ -17,6 +17,7 @@ def test_demo_analysis_and_review_workflow(tmp_path: Path, monkeypatch) -> None:
             calls.append("SES")
             assert "Html" in kwargs["Message"]["Body"]
             assert "Triggered rules" in kwargs["Message"]["Body"]["Html"]["Data"]
+            assert "USER-003" in kwargs["Message"]["Body"]["Text"]["Data"]
             return {"MessageId": "ses-test-message"}
 
     class FakeSns:
@@ -24,6 +25,7 @@ def test_demo_analysis_and_review_workflow(tmp_path: Path, monkeypatch) -> None:
             calls.append("SNS")
             assert kwargs["Subject"].startswith("[HIGH]")
             assert "Triggered evidence" in kwargs["Message"]
+            assert "User ID: USER-003" in kwargs["Message"]
             return {"MessageId": "sns-test-message"}
 
     monkeypatch.setattr(main.boto3, "client", lambda service, **kwargs: FakeSes() if service == "ses" else FakeSns())
@@ -61,6 +63,10 @@ def test_demo_analysis_and_review_workflow(tmp_path: Path, monkeypatch) -> None:
 
     amount_alert = client.get("/fraud-alerts?user_id=USER-002", headers=headers).json()["data"]
     assert any("Unusual Transaction Amount" in alert["triggered_rules"] for alert in amount_alert)
+    amount_flag = next(alert for alert in amount_alert if "Unusual Transaction Amount" in alert["triggered_rules"])
+    amount_detail = client.get(f"/transactions/{amount_flag['transaction_id']}/analysis", headers=headers).json()
+    assert amount_detail["transaction"]["risk_level"] == "MEDIUM"
+    assert {item["channel"] for item in amount_detail["notifications"]} == {"SES", "SNS"}
     travel_alert = client.get("/fraud-alerts?user_id=USER-004", headers=headers).json()["data"]
     assert any("Impossible Geography" in alert["triggered_rules"] for alert in travel_alert)
     travel_item = next(alert for alert in travel_alert if "Impossible Geography" in alert["triggered_rules"])
@@ -110,7 +116,7 @@ def test_sns_is_attempted_when_ses_fails(tmp_path: Path, monkeypatch) -> None:
         transaction_id = db.execute("INSERT INTO transactions(transaction_id,user_id,amount,transaction_date,location,latitude,longitude,device_id) VALUES(?,?,?,?,?,?,?,?)", ("TXN-TEST", user_id, 10000, main.now_iso(), "Mumbai", 19.076, 72.8777, "DEV-TEST")).lastrowid
         flag_id = db.execute("INSERT INTO fraud_flags(transaction_id,risk_level,status,reason,created_at,updated_at) VALUES(?,?,?,?,?,?)", (transaction_id, "HIGH", "UNREVIEWED", "test", main.now_iso(), main.now_iso())).lastrowid
         transaction = db.execute("SELECT * FROM transactions WHERE id=?", (transaction_id,)).fetchone()
-        results = main.send_high_risk_notifications(db, flag_id, transaction, "Test User", "HIGH", [{"rule_name": "Test rule", "severity": "HIGH", "evidence": {}}])
+        results = main.send_high_risk_notifications(db, flag_id, transaction, "USER-TEST", "Test User", "HIGH", [{"rule_name": "Test rule", "severity": "HIGH", "evidence": {}}])
         statuses = {row["channel"]: row["status"] for row in db.execute("SELECT channel,status FROM notifications WHERE fraud_flag_id=?", (flag_id,))}
 
     assert calls == ["SES", "SNS"]
@@ -126,7 +132,7 @@ def test_reference_environment_variable_names_are_supported(tmp_path: Path, monk
     monkeypatch.delenv("AWS_SNS_TOPIC_ARN", raising=False)
     monkeypatch.setenv("SES_SENDER_EMAIL", "reference-sender@example.test")
     monkeypatch.setenv("SES_RECIPIENT_EMAIL", "reference-recipient@example.test")
-    monkeypatch.setenv("SNS_TOPIC_ARN", "arn:aws:sns:ap-south-1:123456789012:reference-topic")
+    monkeypatch.setenv("SNS_TOPIC_ARN", "arn:aws:sns:ap-southeast-2:123456789012:reference-topic")
     sent: dict[str, dict] = {}
 
     class FakeSes:
@@ -146,14 +152,16 @@ def test_reference_environment_variable_names_are_supported(tmp_path: Path, monk
         transaction_id = db.execute("INSERT INTO transactions(transaction_id,user_id,amount,transaction_date,location,latitude,longitude,device_id) VALUES(?,?,?,?,?,?,?,?)", ("TXN-ALIAS", user_id, 70000, main.now_iso(), "Delhi", 28.6139, 77.209, "DEV-ALIAS")).lastrowid
         flag_id = db.execute("INSERT INTO fraud_flags(transaction_id,risk_level,status,reason,created_at,updated_at) VALUES(?,?,?,?,?,?)", (transaction_id, "CRITICAL", "UNREVIEWED", "test", main.now_iso(), main.now_iso())).lastrowid
         transaction = db.execute("SELECT * FROM transactions WHERE id=?", (transaction_id,)).fetchone()
-        result = main.send_high_risk_notifications(db, flag_id, transaction, "<Test User>", "CRITICAL", [{"rule_name": "Amount <threshold>", "severity": "CRITICAL", "evidence": {"detail": "<unsafe>"}}])
+        result = main.send_high_risk_notifications(db, flag_id, transaction, "USER-ALIAS", "<Test User>", "CRITICAL", [{"rule_name": "Amount <threshold>", "severity": "CRITICAL", "evidence": {"detail": "<unsafe>"}}])
 
     assert result["SES"]["status"] == "sent"
     assert result["SNS"]["status"] == "sent"
     assert sent["SES"]["Source"] == "reference-sender@example.test"
     assert sent["SES"]["Destination"]["ToAddresses"] == ["reference-recipient@example.test"]
     assert "&lt;Test User&gt;" in sent["SES"]["Message"]["Body"]["Html"]["Data"]
+    assert "USER-ALIAS" in sent["SES"]["Message"]["Body"]["Text"]["Data"]
     assert sent["SNS"]["TopicArn"].endswith(":reference-topic")
+    assert sent["SNS"]["TopicArn"].split(":")[3] == "ap-southeast-2"
 
 
 def test_mocked_notification_retries_after_configuration_is_added(tmp_path: Path, monkeypatch) -> None:
@@ -167,12 +175,12 @@ def test_mocked_notification_retries_after_configuration_is_added(tmp_path: Path
         transaction_id = db.execute("INSERT INTO transactions(transaction_id,user_id,amount,transaction_date,location,latitude,longitude,device_id) VALUES(?,?,?,?,?,?,?,?)", ("TXN-RETRY", user_id, 10000, main.now_iso(), "Mumbai", 19.076, 72.8777, "DEV-RETRY")).lastrowid
         flag_id = db.execute("INSERT INTO fraud_flags(transaction_id,risk_level,status,reason,created_at,updated_at) VALUES(?,?,?,?,?,?)", (transaction_id, "HIGH", "UNREVIEWED", "test", main.now_iso(), main.now_iso())).lastrowid
         transaction = db.execute("SELECT * FROM transactions WHERE id=?", (transaction_id,)).fetchone()
-        mocked = main.send_high_risk_notifications(db, flag_id, transaction, "Retry User", "HIGH", [])
+        mocked = main.send_high_risk_notifications(db, flag_id, transaction, "USER-RETRY", "Retry User", "HIGH", [])
         assert mocked["SES"]["status"] == "mocked"
 
         monkeypatch.setenv("AWS_SES_SENDER", "verified@example.test")
         monkeypatch.setenv("ALERT_EMAIL", "alerts@example.test")
         monkeypatch.setattr(main.boto3, "client", lambda service, **kwargs: type("Ses", (), {"send_email": lambda self, **payload: {"MessageId": "retry-message"}})())
-        retried = main.send_high_risk_notifications(db, flag_id, transaction, "Retry User", "HIGH", [])
+        retried = main.send_high_risk_notifications(db, flag_id, transaction, "USER-RETRY", "Retry User", "HIGH", [])
 
     assert retried["SES"]["status"] == "sent"
