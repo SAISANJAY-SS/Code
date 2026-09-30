@@ -15,11 +15,15 @@ def test_demo_analysis_and_review_workflow(tmp_path: Path, monkeypatch) -> None:
     class FakeSes:
         def send_email(self, **kwargs):
             calls.append("SES")
+            assert "Html" in kwargs["Message"]["Body"]
+            assert "Triggered rules" in kwargs["Message"]["Body"]["Html"]["Data"]
             return {"MessageId": "ses-test-message"}
 
     class FakeSns:
         def publish(self, **kwargs):
             calls.append("SNS")
+            assert kwargs["Subject"].startswith("[HIGH]")
+            assert "Triggered evidence" in kwargs["Message"]
             return {"MessageId": "sns-test-message"}
 
     monkeypatch.setattr(main.boto3, "client", lambda service, **kwargs: FakeSes() if service == "ses" else FakeSns())
@@ -113,6 +117,43 @@ def test_sns_is_attempted_when_ses_fails(tmp_path: Path, monkeypatch) -> None:
     assert results["SES"]["status"] == "failed"
     assert results["SNS"]["status"] == "sent"
     assert statuses == {"SES": "failed", "SNS": "sent"}
+
+
+def test_reference_environment_variable_names_are_supported(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "sentinel-alias-test.db")
+    monkeypatch.delenv("AWS_SES_SENDER", raising=False)
+    monkeypatch.delenv("ALERT_EMAIL", raising=False)
+    monkeypatch.delenv("AWS_SNS_TOPIC_ARN", raising=False)
+    monkeypatch.setenv("SES_SENDER_EMAIL", "reference-sender@example.test")
+    monkeypatch.setenv("SES_RECIPIENT_EMAIL", "reference-recipient@example.test")
+    monkeypatch.setenv("SNS_TOPIC_ARN", "arn:aws:sns:ap-south-1:123456789012:reference-topic")
+    sent: dict[str, dict] = {}
+
+    class FakeSes:
+        def send_email(self, **kwargs):
+            sent["SES"] = kwargs
+            return {"MessageId": "ses-alias-message"}
+
+    class FakeSns:
+        def publish(self, **kwargs):
+            sent["SNS"] = kwargs
+            return {"MessageId": "sns-alias-message"}
+
+    monkeypatch.setattr(main.boto3, "client", lambda service, **kwargs: FakeSes() if service == "ses" else FakeSns())
+    main.init_db()
+    with main.connect() as db:
+        user_id = db.execute("INSERT INTO users(user_id,name,email,scenario,home_location,latitude,longitude,device_id) VALUES(?,?,?,?,?,?,?,?)", ("USER-ALIAS", "Alias User", "alias@example.test", "test", "Delhi", 28.6139, 77.209, "DEV-ALIAS")).lastrowid
+        transaction_id = db.execute("INSERT INTO transactions(transaction_id,user_id,amount,transaction_date,location,latitude,longitude,device_id) VALUES(?,?,?,?,?,?,?,?)", ("TXN-ALIAS", user_id, 70000, main.now_iso(), "Delhi", 28.6139, 77.209, "DEV-ALIAS")).lastrowid
+        flag_id = db.execute("INSERT INTO fraud_flags(transaction_id,risk_level,status,reason,created_at,updated_at) VALUES(?,?,?,?,?,?)", (transaction_id, "CRITICAL", "UNREVIEWED", "test", main.now_iso(), main.now_iso())).lastrowid
+        transaction = db.execute("SELECT * FROM transactions WHERE id=?", (transaction_id,)).fetchone()
+        result = main.send_high_risk_notifications(db, flag_id, transaction, "<Test User>", "CRITICAL", [{"rule_name": "Amount <threshold>", "severity": "CRITICAL", "evidence": {"detail": "<unsafe>"}}])
+
+    assert result["SES"]["status"] == "sent"
+    assert result["SNS"]["status"] == "sent"
+    assert sent["SES"]["Source"] == "reference-sender@example.test"
+    assert sent["SES"]["Destination"]["ToAddresses"] == ["reference-recipient@example.test"]
+    assert "&lt;Test User&gt;" in sent["SES"]["Message"]["Body"]["Html"]["Data"]
+    assert sent["SNS"]["TopicArn"].endswith(":reference-topic")
 
 
 def test_mocked_notification_retries_after_configuration_is_added(tmp_path: Path, monkeypatch) -> None:
