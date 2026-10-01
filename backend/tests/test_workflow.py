@@ -74,7 +74,7 @@ def test_demo_analysis_and_review_workflow(tmp_path: Path, monkeypatch) -> None:
     assert velocity_result["evidence"]["transaction_count_in_window"] > velocity_result["evidence"]["configured_threshold"]
     assert evidence["notifications"]
     assert {item["channel"] for item in evidence["notifications"]} == {"SES"}
-    assert all(item["status"] == "sent" for item in evidence["notifications"])
+    assert all(item["status"] in {"sent", "skipped"} for item in evidence["notifications"])
 
     review = client.post(f"/transactions/{velocity_alert['transaction_id']}/review", headers=headers, json={"status": "REVIEWED", "comment": "Reviewed in demo"})
     assert review.status_code == 200
@@ -107,6 +107,35 @@ def test_ses_failure_is_recorded(tmp_path: Path, monkeypatch) -> None:
     assert calls == ["SES"]
     assert results["SES"]["status"] == "failed"
     assert statuses == {"SES": "failed"}
+
+
+def test_only_one_ses_email_is_sent_per_user(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr(main, "DB_PATH", tmp_path / "sentinel-one-email-per-user.db")
+    monkeypatch.setenv("AWS_SES_SENDER", "verified@example.test")
+    monkeypatch.setenv("ALERT_EMAIL", "alerts@example.test")
+    calls: list[str] = []
+
+    class FakeSes:
+        def send_email(self, **kwargs):
+            calls.append(kwargs["Message"]["Subject"]["Data"])
+            return {"MessageId": f"ses-message-{len(calls)}"}
+
+    monkeypatch.setattr(main.boto3, "client", lambda service, **kwargs: FakeSes())
+    main.init_db()
+    client = TestClient(main.app)
+    login = client.post("/auth/login", json={"email": "analyst@sentinel.local", "password": "sentinel-demo"})
+    headers = {"Authorization": f"Bearer {login.json()['access_token']}"}
+    assert client.post("/demo/generate", headers=headers).status_code == 200
+
+    result = client.post("/analysis/run/USER-005", headers=headers).json()
+    assert result["flagged_transactions"] > 1
+    assert len(calls) == 1
+    with main.connect() as db:
+        counts = {row["status"]: row["count"] for row in db.execute(
+            "SELECT n.status,COUNT(*) count FROM notifications n JOIN fraud_flags f ON f.id=n.fraud_flag_id JOIN transactions t ON t.id=f.transaction_id JOIN users u ON u.id=t.user_id WHERE u.user_id='USER-005' AND n.channel='SES' GROUP BY n.status"
+        )}
+    assert counts["sent"] == 1
+    assert counts.get("skipped", 0) == result["flagged_transactions"] - 1
 
 
 def test_aws_client_error_code_is_saved_without_raw_response(tmp_path: Path, monkeypatch) -> None:

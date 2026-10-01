@@ -34,7 +34,7 @@ Generate the demo dataset from the dashboard. It creates five profiles and 60 de
 
 ## AWS SES notifications
 
-Every transaction flagged by an active fraud rule triggers a server-side SES email. The message includes the public user ID and triggered-rule evidence in both HTML and plain text. SNS is disabled for now.
+When analysis flags transactions for a user, SENTINEL sends one server-side SES email after that user's first successful delivery. The message includes the public user ID and triggered-rule evidence in both HTML and plain text. Later flagged transactions for that user are recorded as skipped to prevent inbox flooding. SNS is disabled for now.
 
 Copy `backend/.env.example` to `backend/.env` and configure the sender, recipient, and region locally. The active `.env` file is git-ignored. AWS credentials must be available to boto3 through local environment credentials, an AWS profile/SSO session, or an IAM role. Do not commit AWS keys or paste them into chat.
 

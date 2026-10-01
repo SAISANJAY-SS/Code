@@ -197,6 +197,22 @@ def send_high_risk_notifications(
     if prior and prior["status"] == "mocked" and not config["configured"]:
         return {channel: {"status": "mocked", "message_id": "", "error": ""}}
 
+    previous_user_delivery = db.execute(
+        """SELECT n.message_id FROM notifications n
+           JOIN fraud_flags f ON f.id=n.fraud_flag_id
+           JOIN transactions t ON t.id=f.transaction_id
+           JOIN users u ON u.id=t.user_id
+           WHERE u.user_id=? AND n.channel=? AND n.status='sent'
+           ORDER BY n.created_at LIMIT 1""",
+        (user_id, channel),
+    ).fetchone()
+    if previous_user_delivery:
+        db.execute(
+            "INSERT INTO notifications(fraud_flag_id,channel,recipient,status,message_id,error_message,created_at) VALUES(?,?,?,?,?,?,?)",
+            (flag_id, channel, config["destination"] or "development-mock", "skipped", None, None, now_iso()),
+        )
+        return {channel: {"status": "skipped", "message_id": "", "error": "already_sent_for_user"}}
+
     status = "mocked"
     message_id = None
     error_message = None
