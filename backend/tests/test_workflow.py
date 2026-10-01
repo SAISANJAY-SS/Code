@@ -16,7 +16,7 @@ def test_demo_analysis_and_review_workflow(tmp_path: Path, monkeypatch) -> None:
         def send_email(self, **kwargs):
             calls.append("SES")
             assert "Html" in kwargs["Message"]["Body"]
-            assert "Triggered rules" in kwargs["Message"]["Body"]["Html"]["Data"]
+            assert "Why this transaction was flagged" in kwargs["Message"]["Body"]["Html"]["Data"]
             assert "USER-003" in kwargs["Message"]["Body"]["Text"]["Data"]
             return {"MessageId": "ses-test-message"}
 
