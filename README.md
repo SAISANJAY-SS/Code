@@ -34,14 +34,10 @@ Generate the demo dataset from the dashboard. It creates five profiles and 60 de
 
 ## AWS SES notifications
 
-High and critical flags trigger server-side SES email and SNS topic notifications independently. SES includes plain-text and HTML message bodies; SNS receives a plain-text alert. AWS secrets are never stored in the browser or database. Copy `backend/.env.example` to `backend/.env` and enter the values on your machine; that file is ignored by git. Or configure boto3's standard AWS credential provider chain with a local AWS profile or an IAM role in deployment.
+Every transaction flagged by an active fraud rule triggers a server-side SES email. The message includes the public user ID and triggered-rule evidence in both HTML and plain text. SNS is disabled for now.
 
-```sh
-cp backend/.env.example backend/.env
-# Edit backend/.env locally; never paste AWS credentials into chat or frontend code.
-npm run api
-```
+Copy `backend/.env.example` to `backend/.env` and configure the sender, recipient, and region locally. The active `.env` file is git-ignored. AWS credentials must be available to boto3 through local environment credentials, an AWS profile/SSO session, or an IAM role. Do not commit AWS keys or paste them into chat.
 
-Alternatively, configure an AWS CLI profile and set `AWS_PROFILE` instead of adding access keys to the env file. The app accepts `AWS_SES_SENDER` / `ALERT_EMAIL` / `AWS_SNS_TOPIC_ARN`; it also supports the attached reference names `SES_SENDER_EMAIL` / `SES_RECIPIENT_EMAIL` / `SNS_TOPIC_ARN`. SENTINEL-prefixed variables take precedence if both forms are set. Verify the sender identity in SES, and ensure the IAM principal has only `ses:SendEmail` permission for that identity. In the SES sandbox, verify the recipient address too. Set the SNS topic ARN to an existing topic in the same region and grant the IAM principal `sns:Publish` on that topic. Configure topic subscriptions separately. Unconfigured channels are recorded as `mocked`; AWS failures are stored as `failed` without returning credential or provider details to the UI.
+The SES sender identity must be verified in `AWS_REGION`. If the SES account is in its sandbox, verify the recipient address too. Grant the IAM identity `ses:SendEmail` permission for the sender identity. SENTINEL records SES as `mocked` when sender/recipient settings are missing and records a safe AWS error code when sending fails.
 
 The default JWT secret and seeded credentials are for local use only. Set `JWT_SECRET_KEY` to a strong local secret and provision real staff accounts before exposing the service beyond a trusted development environment. PostgreSQL deployment is not configured in this demo.

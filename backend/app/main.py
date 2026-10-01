@@ -143,10 +143,7 @@ def send_high_risk_notifications(
 ) -> dict[str, dict[str, str]]:
     sender = os.getenv("AWS_SES_SENDER") or os.getenv("SES_SENDER_EMAIL", "")
     recipient = os.getenv("ALERT_EMAIL") or os.getenv("SES_RECIPIENT_EMAIL", "")
-    sns_topic_arn = os.getenv("AWS_SNS_TOPIC_ARN") or os.getenv("SNS_TOPIC_ARN", "")
     region = os.getenv("AWS_REGION", "ap-south-1")
-    topic_arn_parts = sns_topic_arn.split(":")
-    sns_region = topic_arn_parts[3] if len(topic_arn_parts) == 6 and topic_arn_parts[2] == "sns" else region
     rule_lines = "\n".join(
         f"- {result['rule_name']} ({result['severity']}): {json.dumps(result['evidence'], ensure_ascii=True)}"
         for result in triggered
@@ -189,65 +186,50 @@ def send_high_risk_notifications(
         "</body></html>"
     )
 
-    results: dict[str, dict[str, str]] = {}
-    channels = {
-        "SES": {"configured": bool(sender and recipient), "destination": recipient, "subject": subject},
-        "SNS": {"configured": bool(sns_topic_arn), "destination": sns_topic_arn, "subject": subject},
-    }
-    for channel, config in channels.items():
-        prior = db.execute(
-            "SELECT status,message_id,error_message FROM notifications WHERE fraud_flag_id=? AND channel=? ORDER BY id DESC LIMIT 1",
-            (flag_id, channel),
-        ).fetchone()
-        if prior and prior["status"] == "sent":
-            results[channel] = {"status": prior["status"], "message_id": prior["message_id"] or "", "error": ""}
-            continue
-        if prior and prior["status"] == "mocked" and not config["configured"]:
-            results[channel] = {"status": "mocked", "message_id": "", "error": ""}
-            continue
+    channel = "SES"
+    config = {"configured": bool(sender and recipient), "destination": recipient, "subject": subject}
+    prior = db.execute(
+        "SELECT status,message_id FROM notifications WHERE fraud_flag_id=? AND channel=? ORDER BY id DESC LIMIT 1",
+        (flag_id, channel),
+    ).fetchone()
+    if prior and prior["status"] == "sent":
+        return {channel: {"status": "sent", "message_id": prior["message_id"] or "", "error": ""}}
+    if prior and prior["status"] == "mocked" and not config["configured"]:
+        return {channel: {"status": "mocked", "message_id": "", "error": ""}}
 
-        status = "mocked"
-        message_id = None
-        error_message = None
-        try:
-            if channel == "SES" and config["configured"]:
-                response = boto3.client("ses", region_name=region).send_email(
-                    Source=sender,
-                    Destination={"ToAddresses": [recipient]},
-                    Message={
-                        "Subject": {"Data": subject, "Charset": "UTF-8"},
-                        "Body": {
-                            "Text": {"Data": body, "Charset": "UTF-8"},
-                            "Html": {"Data": html_body, "Charset": "UTF-8"},
-                        },
+    status = "mocked"
+    message_id = None
+    error_message = None
+    try:
+        if config["configured"]:
+            response = boto3.client("ses", region_name=region).send_email(
+                Source=sender,
+                Destination={"ToAddresses": [recipient]},
+                Message={
+                    "Subject": {"Data": subject, "Charset": "UTF-8"},
+                    "Body": {
+                        "Text": {"Data": body, "Charset": "UTF-8"},
+                        "Html": {"Data": html_body, "Charset": "UTF-8"},
                     },
-                )
-                status = "sent"
-                message_id = response.get("MessageId")
-            elif channel == "SNS" and config["configured"]:
-                response = boto3.client("sns", region_name=sns_region).publish(
-                    TopicArn=sns_topic_arn,
-                    Subject=subject[:100],
-                    Message=body,
-                )
-                status = "sent"
-                message_id = response.get("MessageId")
-        except ClientError as error:
-            status = "failed"
-            error_message = error.response.get("Error", {}).get("Code", "AWSClientError")
-        except BotoCoreError as error:
-            status = "failed"
-            error_message = type(error).__name__
-        except Exception as error:  # Keep unexpected details private; never expose secrets to the UI.
-            status = "failed"
-            error_message = type(error).__name__
+                },
+            )
+            status = "sent"
+            message_id = response.get("MessageId")
+    except ClientError as error:
+        status = "failed"
+        error_message = error.response.get("Error", {}).get("Code", "AWSClientError")
+    except BotoCoreError as error:
+        status = "failed"
+        error_message = type(error).__name__
+    except Exception as error:  # Keep unexpected details private; never expose secrets to the UI.
+        status = "failed"
+        error_message = type(error).__name__
 
-        db.execute(
-            "INSERT INTO notifications(fraud_flag_id,channel,recipient,status,message_id,error_message,created_at) VALUES(?,?,?,?,?,?,?)",
-            (flag_id, channel, config["destination"] or "development-mock", status, message_id, error_message, now_iso()),
-        )
-        results[channel] = {"status": status, "message_id": message_id or "", "error": error_message or ""}
-    return results
+    db.execute(
+        "INSERT INTO notifications(fraud_flag_id,channel,recipient,status,message_id,error_message,created_at) VALUES(?,?,?,?,?,?,?)",
+        (flag_id, channel, config["destination"] or "development-mock", status, message_id, error_message, now_iso()),
+    )
+    return {channel: {"status": status, "message_id": message_id or "", "error": error_message or ""}}
 
 
 def current_staff(token: str = Depends(oauth_scheme)) -> dict[str, Any]:
@@ -507,7 +489,7 @@ def analyze_user(user_id: str, staff: dict[str, Any] = Depends(current_staff)) -
         flag_count = db.execute("SELECT COUNT(*) FROM fraud_flags f JOIN transactions t ON t.id=f.transaction_id WHERE t.user_id=?", (user["id"],)).fetchone()[0]
         notification_counts = db.execute("SELECT n.channel,n.status,COUNT(*) count FROM notifications n JOIN fraud_flags f ON f.id=n.fraud_flag_id JOIN transactions t ON t.id=f.transaction_id WHERE t.user_id=? GROUP BY n.channel,n.status", (user["id"],)).fetchall()
         audit(db, "fraud_analysis_executed", {"user_id": user_id, "transactions_analyzed": len(transactions), "triggered_rule_results": triggered_count, "flags": flag_count}, user_id=staff["id"])
-        notification_summary = {channel: {} for channel in ("SES", "SNS")}
+        notification_summary = {"SES": {}}
         for row in notification_counts:
             notification_summary[row["channel"]][row["status"]] = row["count"]
         return {"user_id": user_id, "transactions_analyzed": len(transactions), "triggered_rule_results": triggered_count, "flagged_transactions": flag_count, "notifications": notification_summary}
